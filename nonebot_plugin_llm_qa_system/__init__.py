@@ -205,9 +205,9 @@ async def handle_list_knowledge(
         await list_cmd.finish("📭 知识库为空")
 
     lines = ["📚 知识库列表："]
-    for e in entries:
+    for i, e in enumerate(entries, 1):
         preview = e.content[:80].replace("\n", " ")
-        lines.append(f"  #{e.id} {e.title} — {preview}{'...' if len(e.content) > 80 else ''}")
+        lines.append(f"  #{e.id} [{i}] {e.title} — {preview}{'...' if len(e.content) > 80 else ''}")
     lines.append(f"\n共 {len(entries)} 条")
 
     # 分批发送避免消息过长
