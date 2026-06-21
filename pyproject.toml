@@ -1,6 +1,6 @@
 [build-system]
 requires = ["setuptools>=61.0"]
-build-backend = "setuptools.backends._legacy:_Backend"
+build-backend = "poetry.core.masonry.api"
 
 [project]
 name = "nonebot-plugin-llm-qa-system"
@@ -28,7 +28,7 @@ dependencies = [
 ]
 
 [project.urls]
-repository = "https://github.com/2580m/nonebot-plugin-llm-qa-system"
+Repository = "https://github.com/2580m/nonebot-plugin-llm-qa-system"
 
 [tool.nonebot]
 plugins = ["nonebot_plugin_llm_qa_system"]
