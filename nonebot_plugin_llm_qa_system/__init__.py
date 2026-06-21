@@ -195,7 +195,7 @@ async def handle_list_knowledge(
     bot: Bot,
     event: GroupMessageEvent,
 ) -> None:
-    """列出知识库所有条目。"""
+    """列出知识库所有条目（分页，每页最多 10 条或 4000 字符）。"""
     async with get_orm_session() as session:
         stmt = select(KnowledgeEntry).order_by(KnowledgeEntry.id)
         result = await session.execute(stmt)
@@ -204,31 +204,43 @@ async def handle_list_knowledge(
     if not entries:
         await list_cmd.finish("📭 知识库为空")
 
-    lines = ["📚 知识库列表："]
+    # 构建条目行
+    entry_lines: list[str] = []
     for i, e in enumerate(entries, 1):
         preview = e.content[:80].replace("\n", " ")
-        lines.append(f"  #{e.id} [{i}] {e.title} — {preview}{'...' if len(e.content) > 80 else ''}")
-    lines.append(f"\n共 {len(entries)} 条")
+        entry_lines.append(
+            f"  #{e.id} [{i}] {e.title} — {preview}{'...' if len(e.content) > 80 else ''}"
+        )
 
-    # 分批发送避免消息过长
-    msg = "\n".join(lines)
-    if len(msg) > 1500:
-        chunks = []
-        current = []
-        for line in lines:
-            if current and len("\n".join(current + [line])) > 1000:
-                chunks.append("\n".join(current))
-                current = [line]
-            else:
-                current.append(line)
-        if current:
-            chunks.append("\n".join(current))
-        # 除最后一条外都用 send，最后一条用 finish
-        for chunk in chunks[:-1]:
-            await list_cmd.send(chunk)
-        await list_cmd.finish(chunks[-1])
-    else:
-        await list_cmd.finish(msg)
+    total = len(entries)
+
+    # 分页：每页最多 10 条或 1500 字符（取先达到者）
+    pages: list[list[str]] = []
+    page: list[str] = []
+    page_len = 0
+    for line in entry_lines:
+        add_cost = len(line) + (1 if page else 0)  # 换行符
+        if (
+            len(page) >= 10
+            or (page and page_len + add_cost > 1500)
+        ):
+            pages.append(page)
+            page = []
+            page_len = 0
+        page.append(line)
+        page_len += len(line) + (1 if len(page) > 1 else 0)
+    if page:
+        pages.append(page)
+
+    # 发送各页
+    header = "📚 知识库列表："
+    for idx, page_lines in enumerate(pages):
+        footer = f"\n— 第 {idx + 1}/{len(pages)} 页，共 {total} 条 —"
+        msg = "\n".join([header] + page_lines + [footer])
+        if idx == len(pages) - 1:
+            await list_cmd.finish(msg)
+        else:
+            await list_cmd.send(msg)
 
 
 # ==================== 搜索知识 ====================
