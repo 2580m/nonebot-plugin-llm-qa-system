@@ -22,6 +22,8 @@ from typing import Any
 
 from datetime import datetime
 
+import jieba_next
+
 from nonebot import on_command, logger, require
 from nonebot.adapters.onebot.v11 import Bot, GroupMessageEvent, permission as perm
 from nonebot.params import CommandArg
@@ -93,7 +95,8 @@ async def handle_qa(
         await qa_cmd.finish("用法：问答 <你的问题>")
 
     # 查询缓存（归一化后精确匹配）
-    normalized_query = _normalize_query(query)
+    # 归一化查询文本；若全部被过滤则回退到原始输入（避免空 key 污染缓存）
+    normalized_query = _normalize_query(query) or query
     async with get_orm_session() as session:
         stmt = select(QACache).where(QACache.query == normalized_query)
         cached = (await session.execute(stmt)).scalar_one_or_none()
@@ -239,15 +242,73 @@ async def _clear_all_cache() -> None:
     engine._embed_cache.clear()
 
 
+# 分词前替换的复合停用短语（按长度降序，避免短短语先替换破坏长短语匹配）
+_COMPOUND_STOPWORDS = sorted([
+    "我想问一下", "我想咨询一下", "我想了解一下",
+    "帮我看一下", "帮我查一下", "帮我确认一下",
+    "顺便问一下", "再问一下", "另外问一下",
+    "请帮我", "能帮我", "可以帮我", "麻烦帮我",
+    "一般来说", "正常来说",
+    "的话呢", "就是说",
+    "想请问一下", "麻烦你了", "辛苦你了",
+    "打扰一下", "请问一下",
+    "方便的话", "顺便问下",
+    "各位好", "老师好",
+    "有空吗", "在吗",
+    "想问一下", "咨询一下", "了解一下",
+    "帮我看", "帮我查", "帮我确认",
+    "顺便问", "劳烦你",
+    "我想", "想问",
+    "打扰了", "辛苦了",
+    "如下", "如上", "如题", "见上", "见下",
+    "附件", "附上",
+    "的话", "您好", "你好",
+    "请问", "麻烦", "劳烦",
+    "帮忙",
+], key=len, reverse=True)
+
+
 def _normalize_query(text: str) -> str:
-    """归一化查询文本，使语义相同但表述不同的问题命中同一缓存。"""
+    """归一化查询文本：分词 + 去停用词 + 重拼接，使不同表述的同类问题命中同一缓存。"""
+    text = text.strip().rstrip("？?。.！!，,；;：:")
+    if not text:
+        return ""
+
+    # 分词前先去掉复合停用短语（jieba 无法将这些整体识别为单词元）
+    for phrase in _COMPOUND_STOPWORDS:
+        text = text.replace(phrase, "")
     text = re.sub(r"\s+", " ", text).strip()
-    for prefix in ("请", "请问", "帮我", "帮我一下"):
-        if text.startswith(prefix):
-            text = text[len(prefix):].lstrip()
-            break
-    text = text.rstrip("？?。.！!，,")
-    return text
+
+    tokens = jieba_next.lcut(text)
+
+    stopwords = {
+        "一", "一个", "一些", "一下", "一种", "上", "下面", "与", "且",
+        "个", "中", "为", "之", "也", "了", "于", "些", "人", "他", "以",
+        "们", "会", "但", "你", "来", "例如", "做", "像", "其", "再", "则",
+        "刚", "到", "又", "及", "可", "可是", "让", "说", "请", "还",
+        "这", "那", "都", "要", "见上", "见下", "认为",
+        "给", "自己", "被", "把", "按照",
+        "啊", "哎呀", "哎哟", "唉", "诶", "欸", "哦", "噢", "喔", "呵",
+        "啦", "呀", "哟", "哇", "嗯", "恩", "额", "呢", "嘛", "吧", "呗",
+        "哈",
+        "在", "因", "因为", "所以", "而", "等", "从而", "从", "向",
+        "关于", "其", "其中", "与否",
+        "能", "能够", "可能",
+        "已经", "已",
+        "并", "并且", "以及", "还有", "另外", "同时",
+        "对", "对于", "将", "就是", "其实", "然后",
+        "相关", "内容", "情况", "事项", "部分", "方面", "东西",
+        "谢谢", "感谢",
+        "大概", "比较", "稍微", "有点",
+        "我想", "想问", "咨询",
+        "一下", "一个", "一些", "一种",
+        "进行", "就是", "那个", "这个",
+        "的话", "的话呢", "就是说",
+        "一般来说", "正常来说",
+    }
+
+    filtered = [t for t in tokens if t not in stopwords and len(t) > 0]
+    return " ".join(filtered) if filtered else text
 
 
 # ==================== 知识管理命令 ====================
