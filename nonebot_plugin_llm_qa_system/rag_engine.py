@@ -20,6 +20,7 @@ class RAGEngine:
             timeout=60,
         )
         self._embed_api_ver: int | None = None  # 1 = /api/embeddings, 2 = /api/embed
+        self._embed_cache: dict[str, list[float]] = {}  # 进程内嵌入缓存
 
     # ==================== 嵌入 ====================
 
@@ -27,16 +28,24 @@ class RAGEngine:
         """调用 Ollama 生成文本嵌入向量。
 
         优先尝试新版 /api/embed API，失败时回退到旧版 /api/embeddings。
+        内置进程级内存缓存，同次运行中重复文本直接返回缓存结果。
         """
+        if text in self._embed_cache:
+            return self._embed_cache[text]
+
         if self._embed_api_ver == 2 or self._embed_api_ver is None:
             try:
-                return await self._embed_v2(text)
+                result = await self._embed_v2(text)
+                self._embed_cache[text] = result
+                return result
             except Exception as e:
                 if self._embed_api_ver == 2:
                     raise
                 logger.warning(f"llm_qa: /api/embed 失败，尝试 /api/embeddings: {e}")
 
-        return await self._embed_v1(text)
+        result = await self._embed_v1(text)
+        self._embed_cache[text] = result
+        return result
 
     async def _embed_v2(self, text: str) -> list[float]:
         """新版 Ollama 嵌入 API (>=0.1.24)"""
@@ -130,7 +139,10 @@ class RAGEngine:
         for entry in entries:
             emb = json.loads(entry.get("embedding", "[]") or "[]")
             if not emb:
-                continue
+                # 嵌入为空时自动重新生成
+                embed_text = f"{entry.get('title', '')}\n{entry.get('content', '')}"
+                emb = await self.embed(embed_text)
+                entry["embedding"] = json.dumps(emb)
             score = self.cosine_similarity(query_emb, emb)
             scored.append((score, entry))
 
