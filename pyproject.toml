@@ -4,7 +4,7 @@ build-backend = "poetry.core.masonry.api"
 
 [tool.poetry]
 name = "nonebot-plugin-llm-qa-system"
-version = "0.1.1"
+version = "0.1.3"
 description = "基于 Ollama + RAG 的智能问答系统"
 readme = "README.md"
 authors = ["BG4JEC <BG4JEC@hotmail.com>"]
@@ -17,7 +17,6 @@ classifiers = [
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "License :: OSI Approved :: MIT License",
-    "Framework :: NoneBot",
 ]
 
 [tool.poetry.dependencies]
