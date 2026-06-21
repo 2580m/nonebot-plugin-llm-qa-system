@@ -28,8 +28,7 @@ dependencies = [
 ]
 
 [project.urls]
-homepage = ""
-repository = ""
+repository = "https://github.com/2580m/nonebot-plugin-llm-qa-system"
 
 [tool.nonebot]
 plugins = ["nonebot_plugin_llm_qa_system"]
