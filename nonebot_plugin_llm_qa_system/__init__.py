@@ -18,9 +18,10 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+from collections import OrderedDict
 from typing import Any
 
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import jieba_next
 
@@ -36,7 +37,7 @@ from nonebot_plugin_orm import get_session as get_orm_session
 from sqlalchemy import delete, select, func
 
 from .config import Config
-from .models import KnowledgeEntry, QACache, EmbeddingCache, AnswerCache
+from .models import KnowledgeEntry, EmbeddingCache, AnswerCache, KnowledgeVersion, SemanticCache
 from .rag_engine import RAGEngine
 
 __plugin_meta__ = PluginMetadata(
@@ -64,6 +65,75 @@ try:
 except ImportError:
     from nonebot import get_driver
     plugin_config = Config.parse_obj(get_driver().config)
+
+# ==================== 内存 LRU 缓存 ====================
+
+
+class LRUCache:
+    """内存 LRU 缓存，达到上限时淘汰最久未使用的条目。"""
+
+    def __init__(self, maxsize: int = 100) -> None:
+        self._maxsize = maxsize
+        self._cache: OrderedDict[str, tuple[str, str]] = OrderedDict()
+
+    def get(self, key: str) -> tuple[str, str] | None:
+        """读取缓存，命中则将该条目移至末尾。"""
+        if key not in self._cache:
+            return None
+        self._cache.move_to_end(key)
+        return self._cache[key]
+
+    def put(self, key: str, answer: str, sources_json: str) -> None:
+        """写入缓存，超出上限时淘汰最久未使用的条目。"""
+        self._cache[key] = (answer, sources_json)
+        self._cache.move_to_end(key)
+        if len(self._cache) > self._maxsize:
+            self._cache.popitem(last=False)
+
+    def clear(self) -> None:
+        """清空缓存。"""
+        self._cache.clear()
+
+    @property
+    def size(self) -> int:
+        return len(self._cache)
+
+
+qa_lru_cache = LRUCache(maxsize=100)
+
+
+class CacheStats:
+    """进程级缓存命中统计。"""
+
+    def __init__(self) -> None:
+        self.embed_hit = 0
+        self.embed_miss = 0
+        self.answer_hit = 0
+        self.answer_miss = 0
+        self.semantic_hit = 0
+        self.semantic_miss = 0
+
+    @property
+    def total_hits(self) -> int:
+        return self.embed_hit + self.answer_hit + self.semantic_hit
+
+    @property
+    def total_misses(self) -> int:
+        return self.embed_miss + self.answer_miss + self.semantic_miss
+
+    @property
+    def total(self) -> int:
+        return self.total_hits + self.total_misses
+
+    @property
+    def hit_rate(self) -> float:
+        if self.total == 0:
+            return 0.0
+        return self.total_hits / self.total * 100
+
+
+cache_stats = CacheStats()
+
 
 # ==================== 全局引擎 ====================
 
@@ -97,18 +167,56 @@ async def handle_qa(
     # 查询缓存（归一化后精确匹配）
     # 归一化查询文本；若全部被过滤则回退到原始输入（避免空 key 污染缓存）
     normalized_query = _normalize_query(query) or query
-    async with get_orm_session() as session:
-        stmt = select(QACache).where(QACache.query == normalized_query)
-        cached = (await session.execute(stmt)).scalar_one_or_none()
-        if cached:
-            sources = json.loads(cached.sources_json)
-            reply = (
-                f"💡 回答：\n{cached.answer}\n\n"
-                f"📎 参考来源：\n" + "\n".join(sources)
-            )
-            await qa_cmd.finish(reply)
+    cached = qa_lru_cache.get(normalized_query)
+    if cached:
+        answer, sources_json = cached
+        sources = json.loads(sources_json)
+        reply = (
+            f"💡 回答：\n{answer}\n\n"
+            f"📎 参考来源：\n" + "\n".join(sources)
+        )
+        await qa_cmd.finish(reply)
 
     await qa_cmd.send(f"🔍 正在思考：{query}")
+
+    # 获取知识库版本和查询向量，用于语义缓存
+    async with get_orm_session() as session:
+        knowledge_version = await _get_knowledge_version(session)
+        query_embedding = await _get_or_compute_embedding(normalized_query, session)
+
+    # 语义缓存检查（同一版本号，最近 200 条）
+    async with get_orm_session() as session:
+        candidates = (
+            await session.execute(
+                select(SemanticCache)
+                .where(SemanticCache.knowledge_version == knowledge_version)
+                .order_by(SemanticCache.created_at.desc())
+                .limit(plugin_config.semantic_cache_max_candidates)
+            )
+        ).scalars().all()
+
+    best_sim = 0.0
+    best_answer = None
+    best_cached_query = None
+    for c in candidates:
+        emb = json.loads(c.query_embedding)
+        sim = RAGEngine.cosine_similarity(query_embedding, emb)
+        if sim > best_sim:
+            best_sim = sim
+            best_answer = c.answer
+            best_cached_query = c.query
+
+    if best_sim >= plugin_config.semantic_cache_threshold:
+        cache_stats.semantic_hit += 1
+        logger.info(
+            f"llm_qa: SemanticCache HIT | "
+            f"query={normalized_query!r} | "
+            f"cached_query={best_cached_query!r} | "
+            f"score={best_sim:.4f} | "
+            f"version={knowledge_version}"
+        )
+        await qa_cmd.finish(f"💡 回答（语义缓存）：\n{best_answer}")
+    cache_stats.semantic_miss += 1
 
     # 加载知识库
     async with get_orm_session() as session:
@@ -159,14 +267,19 @@ async def handle_qa(
     if not relevant:
         await qa_cmd.finish("未找到相关问题，请尝试换一种问法。")
 
-    # 构建上下文文本，计算回答缓存键
-    context_parts: list[str] = []
-    for c in relevant:
-        context_parts.append(f"[{c.get('title', '未知')}]\n{c.get('content', '')}")
-    context_text = "\n\n".join(context_parts)
+    # 构造知识指纹（基于内容的哈希，不依赖数据库序号）
+    content_hashes = sorted(
+        hashlib.sha256(f"{c['title']}\n{c['content']}".encode()).hexdigest()
+        for c in relevant
+    )
+    knowledge_fingerprint = "|".join(content_hashes)
 
-    cache_key = hashlib.md5(
-        f"知识库:\n{context_text}\n问题:\n{normalized_query}".encode()
+    cache_key = hashlib.sha256(
+        f"{knowledge_version}|"
+        f"{plugin_config.llm_qa_system_prompt}|"
+        f"{plugin_config.llm_qa_chat_model}|"
+        f"{knowledge_fingerprint}|"
+        f"{normalized_query}".encode()
     ).hexdigest()
 
     async with get_orm_session() as session:
@@ -176,6 +289,16 @@ async def handle_qa(
             )
         ).scalar_one_or_none()
         if cached_ans:
+            cache_stats.answer_hit += 1
+            # AnswerCache 命中时同步写入语义缓存作为训练样本
+            await _upsert_semantic_cache(
+                session,
+                query=normalized_query,
+                query_embedding=query_embedding,
+                answer=cached_ans.answer,
+                knowledge_version=knowledge_version,
+            )
+            await session.commit()
             sources = json.loads(cached_ans.sources_json)
             reply = (
                 f"💡 回答：\n{cached_ans.answer}\n\n"
@@ -184,6 +307,7 @@ async def handle_qa(
             await qa_cmd.finish(reply)
 
     # 生成回答
+    cache_stats.answer_miss += 1
     await qa_cmd.send("🤖 正在生成回答...")
     answer = await engine.ask(query, relevant)
 
@@ -196,16 +320,8 @@ async def handle_qa(
 
     # 写入各种缓存
     async with get_orm_session() as session:
-        # QACache（归一化 query 精确匹配）
-        existing = (await session.execute(
-            select(QACache).where(QACache.query == normalized_query)
-        )).scalar_one_or_none()
-        if existing:
-            existing.answer = answer
-            existing.sources_json = json.dumps(source_lines)
-            existing.created_at = datetime.now()
-        else:
-            session.add(QACache(query=normalized_query, answer=answer, sources_json=json.dumps(source_lines)))
+        # QACache（归一化 query 精确匹配，内存 LRU）
+        qa_lru_cache.put(normalized_query, answer, json.dumps(source_lines))
 
         # AnswerCache（Prompt 哈希匹配）
         existing_ans = (
@@ -228,18 +344,117 @@ async def handle_qa(
 
         await session.commit()
 
+    # 写入语义缓存（幂等 upsert）
+    async with get_orm_session() as session:
+        await _upsert_semantic_cache(
+            session,
+            query=normalized_query,
+            query_embedding=query_embedding,
+            answer=answer,
+            knowledge_version=knowledge_version,
+        )
+        await session.commit()
+
+    # 定期清理过期语义缓存
+    await _cleanup_semantic_cache()
+
     await qa_cmd.finish(reply)
 
 
 async def _clear_all_cache() -> None:
-    """知识变更后清空问答/回答缓存（嵌入缓存保留，其不依赖知识内容）。"""
-    async with get_orm_session() as session:
-        await session.execute(delete(QACache))
-        await session.execute(delete(AnswerCache))
-        await session.commit()
-    # 同时清空引擎内进程级缓存
+    """知识变更后清空内存问答缓存和进程级嵌入缓存。
+    AnswerCache 基于内容哈希，知识内容不变时自动命中，不清除。"""
+    qa_lru_cache.clear()
     engine = await _get_engine()
     engine._embed_cache.clear()
+
+
+async def _get_knowledge_version(session) -> int:
+    """读取当前知识库版本号，首次调用时初始化为 0。"""
+    stmt = select(KnowledgeVersion).where(KnowledgeVersion.id == 1)
+    kv = (await session.execute(stmt)).scalar_one_or_none()
+    if kv is None:
+        kv = KnowledgeVersion(id=1, version=0)
+        session.add(kv)
+        await session.flush()
+    return kv.version
+
+
+async def _increment_knowledge_version(session) -> int:
+    """知识变更时递增版本号。"""
+    stmt = select(KnowledgeVersion).where(KnowledgeVersion.id == 1)
+    kv = (await session.execute(stmt)).scalar_one_or_none()
+    if kv is None:
+        kv = KnowledgeVersion(id=1, version=0)
+        session.add(kv)
+    kv.version += 1
+    await session.flush()
+    return kv.version
+
+
+async def _get_or_compute_embedding(text: str, session) -> list[float]:
+    """从 EmbeddingCache 读取嵌入向量，未命中则调用 Ollama 并持久化。"""
+    stmt = select(EmbeddingCache).where(
+        EmbeddingCache.text == text,
+        EmbeddingCache.model_name == plugin_config.llm_qa_embed_model,
+    )
+    cached = (await session.execute(stmt)).scalar_one_or_none()
+    if cached:
+        cache_stats.embed_hit += 1
+        return json.loads(cached.embedding)
+
+    cache_stats.embed_miss += 1
+    engine = await _get_engine()
+    embedding = await engine.embed(text)
+    session.add(EmbeddingCache(
+        text=text,
+        model_name=plugin_config.llm_qa_embed_model,
+        embedding=json.dumps(embedding),
+    ))
+    await session.flush()
+    return embedding
+
+
+async def _cleanup_semantic_cache() -> None:
+    """清理过期的语义缓存：删除 30 天前或版本差超过 5 的条目。"""
+    async with get_orm_session() as session:
+        current_version = await _get_knowledge_version(session)
+        cutoff = datetime.now() - timedelta(days=30)
+        await session.execute(
+            delete(SemanticCache).where(SemanticCache.created_at < cutoff)
+        )
+        await session.execute(
+            delete(SemanticCache).where(
+                SemanticCache.knowledge_version < current_version - 5
+            )
+        )
+        await session.commit()
+
+
+async def _upsert_semantic_cache(
+    session,
+    query: str,
+    query_embedding: list[float],
+    answer: str,
+    knowledge_version: int,
+) -> None:
+    """写入语义缓存，同 query + version 已存在时更新（幂等）。"""
+    stmt = select(SemanticCache).where(
+        SemanticCache.query == query,
+        SemanticCache.knowledge_version == knowledge_version,
+    )
+    existing = (await session.execute(stmt)).scalar_one_or_none()
+    if existing:
+        existing.query_embedding = json.dumps(query_embedding)
+        existing.answer = answer
+        existing.created_at = datetime.now()
+    else:
+        session.add(SemanticCache(
+            query=query,
+            query_embedding=json.dumps(query_embedding),
+            answer=answer,
+            knowledge_version=knowledge_version,
+        ))
 
 
 # 分词前替换的复合停用短语（按长度降序，避免短短语先替换破坏长短语匹配）
@@ -336,13 +551,18 @@ async def handle_add_knowledge(
     async with get_orm_session() as session:
         cached_emb = (
             await session.execute(
-                select(EmbeddingCache).where(EmbeddingCache.text == embed_text)
+                select(EmbeddingCache).where(
+                    EmbeddingCache.text == embed_text,
+                    EmbeddingCache.model_name == plugin_config.llm_qa_embed_model,
+                )
             )
         ).scalar_one_or_none()
 
     if cached_emb:
+        cache_stats.embed_hit += 1
         embedding = json.loads(cached_emb.embedding)
     else:
+        cache_stats.embed_miss += 1
         engine = await _get_engine()
         try:
             embedding = await engine.embed(embed_text)
@@ -357,7 +577,11 @@ async def handle_add_knowledge(
 
         # 持久化嵌入缓存
         async with get_orm_session() as session:
-            session.add(EmbeddingCache(text=embed_text, embedding=json.dumps(embedding)))
+            session.add(EmbeddingCache(
+                text=embed_text,
+                model_name=plugin_config.llm_qa_embed_model,
+                embedding=json.dumps(embedding),
+            ))
             await session.commit()
 
     # 入库
@@ -366,10 +590,12 @@ async def handle_add_knowledge(
             title=title,
             content=content,
             embedding=json.dumps(embedding),
+            updated_at=datetime.now(),
         )
         session.add(entry)
         await session.flush()  # 先 flush 让数据库生成自增 ID
         entry_id = entry.id    # flush 后 id 已填充到实例中，此时访问不会触发 lazy load
+        await _increment_knowledge_version(session)
         await session.commit()
 
     # 清空缓存，下次问答重新生成
@@ -531,6 +757,7 @@ async def handle_delete_knowledge(
 
         title = entry.title
         await session.delete(entry)
+        await _increment_knowledge_version(session)
         await session.commit()
 
     await _clear_all_cache()
@@ -561,6 +788,7 @@ async def handle_clear_knowledge(
     async with get_orm_session() as session:
         stmt = delete(KnowledgeEntry)
         result = await session.execute(stmt)
+        await _increment_knowledge_version(session)
         await session.commit()
         count = result.rowcount
 
@@ -580,18 +808,26 @@ async def handle_cache_status(
     event: GroupMessageEvent,
 ) -> None:
     """查看缓存状态。"""
+    qa_count = qa_lru_cache.size
     async with get_orm_session() as session:
-        qa_count = (await session.execute(select(func.count()).select_from(QACache))).scalar()
         emb_count = (await session.execute(select(func.count()).select_from(EmbeddingCache))).scalar()
         ans_count = (await session.execute(select(func.count()).select_from(AnswerCache))).scalar()
+        knowledge_version = await _get_knowledge_version(session)
         mem_count = len((await _get_engine())._embed_cache)
 
     await cache_status_cmd.finish(
         "📊 缓存状态：\n"
-        f"  问答缓存（精确匹配）：{qa_count} 条\n"
+        f"  知识库版本：        {knowledge_version}\n"
+        f"  问答缓存（LRU 精确匹配）：{qa_count} 条\n"
         f"  回答缓存（哈希匹配）：{ans_count} 条\n"
         f"  嵌入缓存（持久化）：  {emb_count} 条\n"
-        f"  嵌入缓存（进程级）：  {mem_count} 条"
+        f"  嵌入缓存（进程级）：  {mem_count} 条\n"
+        f"\n"
+        f"📈 缓存命中统计：\n"
+        f"  Embedding 缓存: 命中 {cache_stats.embed_hit} / 未命中 {cache_stats.embed_miss}\n"
+        f"  Answer 缓存:    命中 {cache_stats.answer_hit} / 未命中 {cache_stats.answer_miss}\n"
+        f"  Semantic 缓存:  命中 {cache_stats.semantic_hit} / 未命中 {cache_stats.semantic_miss}\n"
+        f"  总命中率:       {cache_stats.hit_rate:.1f}%"
     )
 
 

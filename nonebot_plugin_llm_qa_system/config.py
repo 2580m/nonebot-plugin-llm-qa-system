@@ -21,6 +21,12 @@ class Config(BaseModel, extra=Extra.ignore):
     # 余弦相似度最低阈值，低于该值的条目不返回也不展示
     llm_qa_min_score: float = 0.3
 
+    # 语义缓存命中阈值，语义相似度高于此值直接命中缓存，无需检索和 LLM 推理
+    semantic_cache_threshold: float = 0.97
+
+    # 语义缓存最大候选数，每次查询从最近 N 条缓存中匹配
+    semantic_cache_max_candidates: int = 200
+
     # 系统提示词
     llm_qa_system_prompt: str = (
         "你是一个智能问答助手。请根据提供的参考信息，"
