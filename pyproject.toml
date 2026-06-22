@@ -21,13 +21,13 @@ classifiers = [
 ]
 
 [tool.poetry.dependencies]
-    "nonebot2>=2.0.0,<3.0.0",
-    "nonebot-adapter-onebot>=2.0.0,<3.0.0",
-    "nonebot-plugin-orm>=0.7.0",
-    "httpx>=0.24.0",
-    "jieba_next>=1.0.0",
-    "cachetools>=5.3.0",
-    jieba_next = "*"
+python = ">=3.9"
+nonebot2 = ">=2.0.0,<3.0.0"
+nonebot-adapter-onebot = ">=2.0.0,<3.0.0"
+nonebot-plugin-orm = ">=0.8.3"
+httpx = ">=0.24.0"
+jieba_next = "*"
+cachetools = ">=5.3.0"
 
 [tool.nonebot]
 plugins = ["nonebot_plugin_llm_qa_system"]
