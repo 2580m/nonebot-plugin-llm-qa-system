@@ -4,42 +4,92 @@ import json
 import math
 from typing import Any
 
+import httpx
 from cachetools import TTLCache
 from nonebot import logger
 
 from .config import Config
-from src.plugins.gpu_worker.client import GpuWorkerClient
 
 
 class RAGEngine:
     """基于 Ollama 的 RAG 引擎，提供嵌入、检索、问答能力。"""
 
-    def __init__(
-        self,
-        config: Config,
-        gpu_client: GpuWorkerClient | None = None,
-    ) -> None:
+    def __init__(self, config: Config) -> None:
         self.config = config
-        self._gpu_client = gpu_client
-        self._owns_client = gpu_client is None
+        self._http = httpx.AsyncClient(
+            base_url=config.llm_qa_ollama_host,
+            timeout=60,
+        )
+        self._embed_api_ver: int | None = None  # 1 = /api/embeddings, 2 = /api/embed
         self._embed_cache: TTLCache = TTLCache(maxsize=5000, ttl=86400)  # 进程内嵌入缓存
 
     # ==================== 嵌入 ====================
 
     async def embed(self, text: str) -> list[float]:
-        """调用 GPU Worker 生成文本嵌入向量。
+        """调用 Ollama 生成文本嵌入向量。
 
+        优先尝试新版 /api/embed API，失败时回退到旧版 /api/embeddings。
         内置进程级内存缓存，同次运行中重复文本直接返回缓存结果。
         """
         if text in self._embed_cache:
             return self._embed_cache[text]
 
-        client = await self._get_client()
-        result = await client.ollama_embed(text, model=self.config.llm_qa_embed_model)
-        if result is None:
-            raise RuntimeError("嵌入生成失败，GPU Worker 返回空结果")
+        if self._embed_api_ver == 2 or self._embed_api_ver is None:
+            try:
+                result = await self._embed_v2(text)
+                self._embed_cache[text] = result
+                return result
+            except Exception as e:
+                if self._embed_api_ver == 2:
+                    raise
+                logger.warning(f"llm_qa: /api/embed 失败，尝试 /api/embeddings: {e}")
+
+        result = await self._embed_v1(text)
         self._embed_cache[text] = result
         return result
+
+    async def _embed_v2(self, text: str) -> list[float]:
+        """新版 Ollama 嵌入 API (>=0.1.24)"""
+        resp = await self._http.post(
+            "/api/embed",
+            json={
+                "model": self.config.llm_qa_embed_model,
+                "input": text,
+            },
+        )
+        resp.raise_for_status()
+        data = resp.json()
+
+        embeddings = data.get("embeddings")
+        if embeddings and isinstance(embeddings, list) and len(embeddings) > 0:
+            self._embed_api_ver = 2
+            return embeddings[0]
+
+        single = data.get("embedding")
+        if single and isinstance(single, list):
+            self._embed_api_ver = 2
+            return single
+
+        raise RuntimeError(f"无法解析 /api/embed 响应: {data.keys()}")
+
+    async def _embed_v1(self, text: str) -> list[float]:
+        """旧版 Ollama 嵌入 API"""
+        resp = await self._http.post(
+            "/api/embeddings",
+            json={
+                "model": self.config.llm_qa_embed_model,
+                "prompt": text,
+            },
+        )
+        resp.raise_for_status()
+        data = resp.json()
+
+        embedding = data.get("embedding")
+        if embedding and isinstance(embedding, list):
+            self._embed_api_ver = 1
+            return embedding
+
+        raise RuntimeError(f"无法解析 /api/embeddings 响应: {data.keys()}")
 
     # ==================== 相似度 ====================
 
@@ -88,7 +138,6 @@ class RAGEngine:
         for entry in entries:
             emb = json.loads(entry.get("embedding", "[]") or "[]")
             if not emb:
-                # 嵌入为空时自动重新生成
                 embed_text = f"{entry.get('title', '')}\n{entry.get('content', '')}"
                 emb = await self.embed(embed_text)
                 entry["embedding"] = json.dumps(emb)
@@ -117,7 +166,6 @@ class RAGEngine:
         Returns:
             LLM 生成的回答文本。
         """
-        # 构建上下文文本（带长度限制）
         context_parts: list[str] = []
         current_len = 0
         for i, chunk in enumerate(context_chunks, 1):
@@ -151,24 +199,21 @@ class RAGEngine:
             messages.append({"role": "user", "content": query})
 
         try:
-            client = await self._get_client()
-            result = await client.ollama_chat(messages, model=self.config.llm_qa_chat_model)
-            if result is None:
-                raise RuntimeError("回答生成失败，GPU Worker 返回空结果")
-            return result
+            resp = await self._http.post(
+                "/api/chat",
+                json={
+                    "model": self.config.llm_qa_chat_model,
+                    "messages": messages,
+                    "stream": False,
+                },
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            return data.get("message", {}).get("content", "抱歉，我没有得到有效的回答。")
         except Exception as e:
             logger.error(f"llm_qa: LLM 调用失败: {e}")
             return f"抱歉，调用语言模型时出错：{e}"
 
-    async def _get_client(self) -> GpuWorkerClient:
-        """获取 GPU Worker 客户端，按需延迟初始化。"""
-        if self._gpu_client is None:
-            self._gpu_client = GpuWorkerClient()
-            self._owns_client = True
-        return self._gpu_client
-
     async def close(self) -> None:
-        """关闭 GPU Worker 客户端（仅当由本引擎创建时）。"""
-        if self._owns_client and self._gpu_client is not None:
-            await self._gpu_client.close()
-            self._gpu_client = None
+        """关闭 HTTP 客户端。"""
+        await self._http.aclose()
