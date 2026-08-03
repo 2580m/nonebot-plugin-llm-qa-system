@@ -6,8 +6,11 @@ from pydantic import BaseModel, Extra
 class Config(BaseModel, extra=Extra.ignore):
     """插件配置项，在 .env 文件中设置"""
 
-    # Ollama 服务地址
+    # Ollama 服务地址（用于对话模型）
     llm_qa_ollama_host: str = "http://localhost:11434"
+
+    # Embedding 服务地址，留空则复用 llm_qa_ollama_host（即使用 Ollama 的嵌入能力）
+    llm_qa_embed_host: str = ""
 
     # 对话模型名称
     llm_qa_chat_model: str = "qwen3:1.7b"

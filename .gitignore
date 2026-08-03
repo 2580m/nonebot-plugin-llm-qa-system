@@ -1,3 +1,4 @@
 build/
 dist/
 nonebot_plugin_llm_qa_system.egg-info/
+/nonebot_plugin_llm_qa_system/migrations/__pycache__

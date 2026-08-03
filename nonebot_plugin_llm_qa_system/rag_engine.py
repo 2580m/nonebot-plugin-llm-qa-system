@@ -20,19 +20,35 @@ class RAGEngine:
             base_url=config.llm_qa_ollama_host,
             timeout=60,
         )
+        # 如果独立配置了 embedding 服务地址，创建独立的 HTTP 客户端
+        self._use_external_embed = bool(config.llm_qa_embed_host)
+        if self._use_external_embed:
+            self._embed_http = httpx.AsyncClient(
+                base_url=config.llm_qa_embed_host,
+                timeout=60,
+            )
+        else:
+            self._embed_http = self._http
         self._embed_api_ver: int | None = None  # 1 = /api/embeddings, 2 = /api/embed
         self._embed_cache: TTLCache = TTLCache(maxsize=5000, ttl=86400)  # 进程内嵌入缓存
 
     # ==================== 嵌入 ====================
 
     async def embed(self, text: str) -> list[float]:
-        """调用 Ollama 生成文本嵌入向量。
+        """生成文本嵌入向量。
 
-        优先尝试新版 /api/embed API，失败时回退到旧版 /api/embeddings。
+        若配置了独立的 embedding 服务地址（llm_qa_embed_host），则调用
+        外部服务的 /embed 端点（兼容 embeddings.cpp / TEI 协议）；
+        否则使用 Ollama 的 /api/embed 或 /api/embeddings（向后兼容）。
         内置进程级内存缓存，同次运行中重复文本直接返回缓存结果。
         """
         if text in self._embed_cache:
             return self._embed_cache[text]
+
+        if self._use_external_embed:
+            result = await self._embed_via_external(text)
+            self._embed_cache[text] = result
+            return result
 
         if self._embed_api_ver == 2 or self._embed_api_ver is None:
             try:
@@ -90,6 +106,24 @@ class RAGEngine:
             return embedding
 
         raise RuntimeError(f"无法解析 /api/embeddings 响应: {data.keys()}")
+
+    async def _embed_via_external(self, text: str) -> list[float]:
+        """调用外部 embedding 服务（兼容 embeddings.cpp / TEI / OpenAI 兼容协议）。
+
+        请求格式: POST /embed  {"inputs": ["text"]}
+        响应格式: [[0.1, 0.2, ...]]
+        """
+        resp = await self._embed_http.post(
+            "/embed",
+            json={"inputs": [text]},
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        if isinstance(data, list) and len(data) > 0 and isinstance(data[0], list):
+            return data[0]
+        raise RuntimeError(
+            f"外部 embedding 服务返回格式异常: {type(data)}"
+        )
 
     # ==================== 相似度 ====================
 
@@ -217,3 +251,5 @@ class RAGEngine:
     async def close(self) -> None:
         """关闭 HTTP 客户端。"""
         await self._http.aclose()
+        if self._use_external_embed:
+            await self._embed_http.aclose()

@@ -3,14 +3,15 @@
 基于本地 Ollama 大模型 + 语义检索的知识问答机器人。
 
 命令:
-  问答 <问题>          — 基于知识库回答用户问题
-  添加知识 <标题> <内容>  — 向知识库添加条目
-  删除知识 <id>         — 删除指定知识条目
-  列出知识              — 列出知识库所有条目
-  清空知识              — 清空知识库（需确认）
-  搜索知识 <关键词>      — 搜索知识库
-  缓存状态              — 查看缓存统计
-  清空缓存              — 清空所有缓存（需确认）
+   问答 <问题>            — 基于知识库回答用户问题
+   添加知识 <标题> <内容>    — 向知识库添加条目
+   删除知识 <id>           — 删除指定知识条目
+   列出知识                — 列出知识库所有条目
+   清空知识                — 清空知识库（需确认）
+   搜索知识 <关键词>        — 搜索知识库
+   重建向量                — 重建所有向量（切换 Embedding 模型后用）
+   缓存状态                — 查看缓存统计
+   清空缓存                — 清空所有缓存（需确认）
 """
 
 from __future__ import annotations
@@ -49,13 +50,14 @@ __plugin_meta__ = PluginMetadata(
         "删除知识 <id> — 删除指定条目\n"
         "列出知识 — 列出所有条目\n"
         "搜索知识 <关键词> — 语义搜索\n"
+        "重建向量 — 重建所有向量（切换 Embedding 模型后用）\n"
         "清空知识 — 清空全部（需确认）\n"
         "缓存状态 — 查看缓存统计\n"
         "清空缓存 — 清空所有缓存（需确认）"
     ),
-    homepage="https://github.com/2580m/nonebot-plugin-llm-qa-system",
     type="application",
     config=Config,
+    supported_adapters={"~onebot.v11"},
 )
 
 # ==================== 配置加载 ====================
@@ -199,15 +201,35 @@ async def handle_qa(
     best_sim = 0.0
     best_answer = None
     best_cached_query = None
+    # 记录 top-3 相似度用于调试
+    top_scores: list[tuple[float, str]] = []
     for c in candidates:
         emb = json.loads(c.query_embedding)
         sim = RAGEngine.cosine_similarity(query_embedding, emb)
+        top_scores.append((sim, c.query))
         if sim > best_sim:
             best_sim = sim
             best_answer = c.answer
             best_cached_query = c.query
 
-    if best_sim >= plugin_config.semantic_cache_threshold:
+    top_scores.sort(key=lambda x: -x[0])
+    threshold = plugin_config.semantic_cache_threshold
+
+    logger.info(
+        f"llm_qa: SemanticCache 候选数={len(candidates)} | "
+        f"最佳相似度={best_sim:.4f} | 阈值={threshold} | "
+        f"命中={best_sim >= threshold} | "
+        f"当前query={normalized_query!r} | "
+        f"最佳匹配query={best_cached_query!r} | "
+        f"版本={knowledge_version}"
+    )
+    if top_scores:
+        for rank, (score, q) in enumerate(top_scores[:3], 1):
+            logger.info(
+                f"llm_qa:   Top-{rank} sim={score:.4f} query={q!r}"
+            )
+
+    if best_sim >= threshold:
         cache_stats.semantic_hit += 1
         logger.info(
             f"llm_qa: SemanticCache HIT | "
@@ -852,6 +874,95 @@ async def handle_clear_cache(
 
     await _clear_all_cache()
     await clear_cache_cmd.finish("🗑️ 已清空所有缓存")
+
+
+# ==================== 重建向量 ====================
+
+rebuild_cmd = on_command("重建向量", permission=SUPERUSER, priority=10, block=True)
+
+
+@rebuild_cmd.handle()
+async def handle_rebuild_embeddings(
+    bot: Bot,
+    event: GroupMessageEvent,
+) -> None:
+    """重建所有知识条目的嵌入向量（切换 Embedding 模型后使用）。"""
+    start_time = datetime.now()
+
+    async with get_orm_session() as session:
+        stmt = select(KnowledgeEntry)
+        result = await session.execute(stmt)
+        entries = result.scalars().all()
+
+    if not entries:
+        await rebuild_cmd.finish("📭 知识库为空，无需重建。")
+
+    total = len(entries)
+    await rebuild_cmd.send(f"🔄 开始重建知识库向量，共 {total} 条知识...")
+
+    # 先清空旧模型的 EmbeddingCache，避免命中缓存跳过重新计算
+    async with get_orm_session() as session:
+        await session.execute(delete(EmbeddingCache))
+        await session.commit()
+
+    # Phase 1: 批量生成嵌入向量（每 BATCH_SIZE 条共享一个 session，减少 commit 次数）
+    BATCH_SIZE = 100
+    embeddings: dict[int, list[float]] = {}
+    for batch_start in range(0, len(entries), BATCH_SIZE):
+        batch = entries[batch_start:batch_start + BATCH_SIZE]
+        try:
+            async with get_orm_session() as s:
+                for entry in batch:
+                    embed_text = f"{entry.title}\n{entry.content}"
+                    embeddings[entry.id] = await _get_or_compute_embedding(embed_text, s)
+                await s.commit()  # 一批只 commit 一次
+        except Exception as e:
+            logger.warning(f"llm_qa: 重建批次失败 ({batch_start + 1}-{batch_start + len(batch)})，"
+                           f"回退到逐条处理: {e}")
+            # 批次内某条异常导致整个 session 不可用，回退到逐条独立 session
+            for entry in batch:
+                if entry.id in embeddings:
+                    continue
+                try:
+                    async with get_orm_session() as s:
+                        embed_text = f"{entry.title}\n{entry.content}"
+                        embeddings[entry.id] = await _get_or_compute_embedding(embed_text, s)
+                        await s.commit()
+                except Exception as e2:
+                    logger.error(f"llm_qa: 重建嵌入失败 (id={entry.id}): {e2}")
+
+    if not embeddings:
+        await rebuild_cmd.finish("❌ 所有知识条目重建均失败，请检查 Embedding 服务。")
+
+    # Phase 2: 批量写入数据库 + 清理缓存 + 版本递增（原子操作）
+    async with get_orm_session() as session:
+        stmt = select(KnowledgeEntry)
+        result = await session.execute(stmt)
+        for entry in result.scalars().all():
+            if entry.id in embeddings:
+                entry.embedding = json.dumps(embeddings[entry.id])
+
+        await session.execute(delete(SemanticCache))
+        await session.execute(delete(AnswerCache))
+        new_version = await _increment_knowledge_version(session)
+        await session.commit()
+
+    # 清理进程级缓存
+    await _clear_all_cache()
+
+    elapsed = (datetime.now() - start_time).total_seconds()
+
+    await rebuild_cmd.finish(
+        f"✅ 知识库向量重建完成\n\n"
+        f"共重建：{len(embeddings)} / {total} 条\n"
+        f"耗时：{elapsed:.1f} 秒\n\n"
+        f"已清理：\n"
+        f"- EmbeddingCache\n"
+        f"- SemanticCache\n"
+        f"- AnswerCache\n\n"
+        f"知识库版本已更新至：V{new_version}"
+    )
+
 
 from nonebot import get_driver
 
