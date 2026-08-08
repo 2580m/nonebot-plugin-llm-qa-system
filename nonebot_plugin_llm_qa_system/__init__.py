@@ -56,6 +56,7 @@ __plugin_meta__ = PluginMetadata(
         "清空缓存 — 清空所有缓存（需确认）"
     ),
     type="application",
+    homepage="https://github.com/2580m/nonebot-plugin-llm-qa-system",
     config=Config,
     supported_adapters={"~onebot.v11"},
 )
